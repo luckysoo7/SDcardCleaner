@@ -37,7 +37,8 @@ OPEN_EXISTING = 3
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 # IOCTL 코드
-IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
+IOCTL_DISK_GET_DRIVE_GEOMETRY_EX   = 0x000700A0
+IOCTL_STORAGE_GET_DEVICE_NUMBER    = 0x002D1080  # 볼륨 → 물리 디스크 번호 조회
 FSCTL_LOCK_VOLUME     = 0x00090018  # 볼륨 잠금 (직접 쓰기 전 필수)
 FSCTL_DISMOUNT_VOLUME = 0x00090020  # 볼륨 마운트 해제
 
@@ -56,6 +57,7 @@ class DriveInfo:
     label: str         # 볼륨 레이블 (예: 'SD카드')
     size_bytes: int    # 총 용량 (바이트)
     fstype: str        # 파일시스템 (예: 'FAT32')
+    disk_number: int = -1  # 물리 디스크 번호 (diskpart select disk N 용)
 
     @property
     def size_gb(self) -> float:
@@ -148,6 +150,7 @@ class DriveDetector:
                     label=label,
                     size_bytes=size,
                     fstype=fstype,
+                    disk_number=self._get_disk_number(letter),
                 ))
             except Exception:
                 continue
@@ -167,6 +170,40 @@ class DriveDetector:
             if drive_type == DRIVE_REMOVABLE:
                 letters.append(letter)
         return letters
+
+    def _get_disk_number(self, letter: str) -> int:
+        """
+        IOCTL_STORAGE_GET_DEVICE_NUMBER로 드라이브 문자 → 물리 디스크 번호 조회.
+        diskpart의 'select disk N'에 필요. 실패 시 -1 반환.
+        """
+        class STORAGE_DEVICE_NUMBER(ctypes.Structure):
+            _fields_ = [
+                ("DeviceType",   ctypes.c_ulong),
+                ("DeviceNumber", ctypes.c_ulong),
+                ("PartitionNumber", ctypes.c_ulong),
+            ]
+
+        path = f"\\\\.\\{letter}:"
+        ctypes.windll.kernel32.CreateFileW.restype = ctypes.c_void_p
+        handle = ctypes.windll.kernel32.CreateFileW(
+            path, 0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None, OPEN_EXISTING, 0, None
+        )
+        if handle is None or handle == INVALID_HANDLE_VALUE:
+            return -1
+        try:
+            sdn = STORAGE_DEVICE_NUMBER()
+            returned = ctypes.c_ulong(0)
+            ok = ctypes.windll.kernel32.DeviceIoControl(
+                handle, IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                None, 0,
+                ctypes.byref(sdn), ctypes.sizeof(sdn),
+                ctypes.byref(returned), None
+            )
+            return sdn.DeviceNumber if ok else -1
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
 
     def _get_volume_label(self, letter: str) -> str:
         """볼륨 레이블 조회"""
@@ -411,10 +448,19 @@ class DiskFormatter:
     def _format_via_diskpart(self, fs_type: str) -> bool:
         """
         diskpart 스크립트로 포맷.
-        select volume → format fs=... quick → assign letter 순서.
+
+        'select volume E' 방식은 랜덤 덮어쓰기 후 파일시스템이 사라지면
+        Windows가 드라이브 문자를 제거해 버려서 실패함.
+        물리 디스크 번호(disk_number)로 'select disk N' 하면 파일시스템 상태와 무관.
         """
+        if self.drive.disk_number < 0:
+            raise ValueError("디스크 번호를 알 수 없어 diskpart 포맷 불가")
+
         script = (
-            f"select volume {self.drive.letter}\n"
+            f"select disk {self.drive.disk_number}\n"
+            "clean\n"
+            "create partition primary\n"
+            "select partition 1\n"
             f"format fs={fs_type} quick label=SDCARD\n"
             f"assign letter={self.drive.letter}\n"
             "exit\n"
@@ -505,7 +551,8 @@ class WipeWorker(threading.Thread):
                 self.q.put(('cancelled',))
                 return
 
-            on_status("포맷 중... (잠시 기다려 주세요)")
+            # format_start: GUI가 progressbar를 indeterminate 모드로 전환
+            self.q.put(('format_start',))
             fmt_ok = DiskFormatter(self.drive).format_drive(self.fs_type)
             self.q.put(('done', fmt_ok))
 
@@ -785,6 +832,12 @@ class SDCleanerApp(tk.Tk):
                 elif kind == 'status':
                     self._status_label.config(text=msg[1])
 
+                elif kind == 'format_start':
+                    # 포맷 중: 진행바를 물결 애니메이션으로 전환 (diskpart 동안 멈춰 보이는 것 방지)
+                    self._progressbar.config(mode='indeterminate')
+                    self._progressbar.start(15)
+                    self._status_label.config(text="포맷 중... (30초~2분 소요, 잠시 기다려 주세요)")
+
                 elif kind == 'done':
                     success = msg[1]
                     self._on_complete(success)
@@ -807,6 +860,9 @@ class SDCleanerApp(tk.Tk):
 
     def _on_complete(self, success: bool):
         """작업 완료 처리"""
+        # indeterminate 모드 해제 후 determinate 100%로 복구
+        self._progressbar.stop()
+        self._progressbar.config(mode='determinate')
         self._progress_var.set(100)
         if success:
             self._status_label.config(
